@@ -185,9 +185,12 @@ version of Queuelib to be readable by a different one.
 Choosing a disk queue class
 ---------------------------
 
-``FifoDiskQueue`` and ``LifoDiskQueue`` are fast and lose data. They keep their
-bookkeeping in memory until ``close()``, so a crash costs every item pushed
-since the last ``close()`` call, and a failed write leaves the queue corrupt.
+``FifoDiskQueue`` and ``LifoDiskQueue`` are fast and lose the items that a
+crash did not account for. Their bookkeeping is only written on ``close()``
+(and, since 1.11, atomically), so a crash costs every item pushed since the
+last ``close()`` call. Reopening one of those queues after a crash is safe:
+the stale items are discarded and never overtake the items of the recovering
+session, and a failed write leaves the queue either recoverable or unopenable.
 
 ``FifoSQLiteQueue`` and ``LifoSQLiteQueue`` commit every ``push()`` and
 ``pop()`` call, so a crash or a failed write costs nothing. Each commit waits
@@ -203,42 +206,74 @@ each failure mode in detail.
 Always close disk queues
 ------------------------
 
-``FifoDiskQueue`` and ``LifoDiskQueue`` do not survive a crash. Every item
-pushed since the last ``close()`` call is lost if the process is killed or the
-machine loses power.
-
-While one of those queues is open, its bookkeeping (number of items, read and
-write positions) only lives in memory, and ``close()`` is what writes it to
-disk. Queuelib never calls ``fsync()`` either, and ``LifoDiskQueue`` writes
-items through a buffered file object, so the most recent items may not have
-reached the disk at all.
-
-Calling ``close()`` is hence mandatory::
+Closing a disk queue is still mandatory, but no longer closing one is no longer
+corrupting. ``FifoDiskQueue`` and ``LifoDiskQueue`` keep an on-disk marker
+(inside ``info.json``, or in a sidecar ``.qmeta`` file) that records whether
+the queue was open the last time it was used, together with the position of
+the last clean ``close()``::
 
     from contextlib import closing
 
     with closing(FifoDiskQueue("queuedir")) as q:
         q.push(b'a')
 
-If a process ends without calling ``close()``, the queue on disk keeps the
-bookkeeping that the last ``close()`` call wrote, which no longer matches the
-files. Items pushed since then become unreachable, and using the queue again
-is unsafe: it may report a wrong length, return items that had already been
-popped, delete files that still contain items, or raise an exception. Queuelib
-offers no way to repair or to recover such a queue.
+If a process is killed or the machine loses power before ``close()`` runs,
+reopening the queue reconciles it against that last clean state:
+
+- every item pushed by the crashed session becomes unreachable, exactly as
+  documented below; stale items never jump ahead of, or replace, items pushed
+  by the recovering session;
+- items that the recovering session has not delivered yet survive a later
+  ``close()`` or ``clear()``;
+- this holds over any number of repeated crash/recovery rounds in the same
+  process.
+
+There are two unavoidable limits. Queuelib never calls ``fsync()``, and
+``LifoDiskQueue`` writes items through a buffered file object, so the most
+recent writes may never have reached the disk at all. Also, items that the
+crashed session had already popped may be delivered again once the queue is
+reopened: the bookkeeping only advances on ``close()``, so the recovery point
+predates those pops. Treat delivery as at-least-once across a crash.
 
 A SQLite queue that is not closed keeps every item that was pushed. It still
 needs ``close()`` to delete the file of an empty queue.
+
+Recovering from torn bookkeeping
+--------------------------------
+
+The bookkeeping files are replaced atomically, so a power loss halfway through
+a write leaves the previous version intact instead of a half-written file.
+Torn or otherwise invalid bookkeeping can still happen if the underlying
+storage loses whole pages, or if a ``LifoDiskQueue`` ``pop()`` had truncated
+the data file before the crash, in which case accounted and stale bytes can no
+longer be told apart.
+
+In those cases opening the queue raises :class:`~queuelib.QueueRecoveryError`,
+a ``ValueError`` subclass. Queuelib never silently discards the affected data,
+and the error is raised from the constructor, before any read or write can
+happen, so there is no half-initialized queue. Remove the queue's path and use
+it again to create a new, empty queue::
+
+    from queuelib import QueueRecoveryError
+    import shutil
+
+    try:
+        q = FifoDiskQueue("queuedir")
+    except QueueRecoveryError:
+        shutil.rmtree("queuedir")
+        q = FifoDiskQueue("queuedir")
 
 A failed push corrupts a file queue
 -----------------------------------
 
 ``push()`` on ``FifoDiskQueue`` or ``LifoDiskQueue`` may fail part way through
 writing an item, for example with ``OSError`` when the disk is full. Queuelib
-does not undo the part that was written, so from that point on the queue is
-corrupt: ``pop()`` may return truncated or wrong data, or raise an exception,
-and reopening the queue later does not help. Stop using a queue whose
-``push()`` call raised.
+does not undo the part that was written. On the next reopen, the recovery
+described above truncates the file back to the last clean state, so the
+half-written item becomes unreachable instead of being returned by ``pop()``;
+the rare cases where that is not possible raise
+:class:`~queuelib.QueueRecoveryError`. Stop using a queue whose ``push()``
+call raised until it has been reopened.
 
 On a SQLite queue the failed ``push()`` call is rolled back and the queue stays
 usable.

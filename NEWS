@@ -1,6 +1,22 @@
 Queuelib release notes
 ======================
 
+Version 1.11.0
+---------------
+(unreleased)
+
+* ``FifoDiskQueue`` and ``LifoDiskQueue`` now recover safely from a process
+  crash or power loss: pushes made by the crashed session stay unreachable and
+  can no longer overtake recovering-session items, and undelivered
+  recovering-session items survive a later ``close()`` or ``clear()``
+* Queue bookkeeping is now written atomically; torn or otherwise invalid
+  bookkeeping raises the new ``QueueRecoveryError`` (a ``ValueError``
+  subclass) from the queue constructor instead of leaving the queue
+  permanently unopenable
+* ``LifoDiskQueue`` stores its crash-recovery marker in a new ``.qmeta``
+  sidecar file; queues written by older versions are imported automatically
+  after validation
+
 Version 1.10.0
 ---------------
 (released on 2026-08-24)
